@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using Microsoft.Win32;
 
 namespace CaptureInputSwitcher
 {
@@ -23,18 +25,18 @@ namespace CaptureInputSwitcher
                     case "list":
                         return ListDevices();
                     case "inputs":
-                        return ListInputs(deviceName ?? "USB3HDCAP");
+                        return ListInputs(deviceName ?? "CY3014");
                     case "switch":
                         if (args.Length < 2)
                         {
-                            Console.WriteLine("Error: switch requires a pin number");
+                            Console.WriteLine("Error: switch requires an input number (0 or 1)");
                             return 1;
                         }
                         return SwitchInput(
-                            args.Length >= 3 ? args[2] : "USB3HDCAP",
+                            args.Length >= 3 ? args[2] : "CY3014",
                             int.Parse(args[1]));
                     case "get":
-                        return GetCurrentInput(deviceName ?? "USB3HDCAP");
+                        return GetCurrentInput(deviceName ?? "CY3014");
                     default:
                         return PrintUsage();
                 }
@@ -54,34 +56,40 @@ namespace CaptureInputSwitcher
             Console.WriteLine("Usage:");
             Console.WriteLine("  CaptureInputSwitcher list                    - List all video capture devices");
             Console.WriteLine("  CaptureInputSwitcher inputs [device]         - List available inputs for device");
-            Console.WriteLine("  CaptureInputSwitcher switch <pin> [device]   - Switch to input pin number");
+            Console.WriteLine("  CaptureInputSwitcher switch <input> [device] - Switch to input (0=HDMI, 1=DVI)");
             Console.WriteLine("  CaptureInputSwitcher get [device]            - Get current input");
             Console.WriteLine();
             Console.WriteLine("Examples:");
             Console.WriteLine("  CaptureInputSwitcher list");
-            Console.WriteLine("  CaptureInputSwitcher inputs USB3HDCAP");
-            Console.WriteLine("  CaptureInputSwitcher switch 0 USB3HDCAP      - Switch to first input (usually HDMI)");
-            Console.WriteLine("  CaptureInputSwitcher switch 1 USB3HDCAP      - Switch to second input (usually DVI)");
+            Console.WriteLine("  CaptureInputSwitcher inputs CY3014");
+            Console.WriteLine("  CaptureInputSwitcher switch 0 CY3014         - Switch to HDMI (input 0)");
+            Console.WriteLine("  CaptureInputSwitcher switch 1 CY3014         - Switch to DVI (input 1)");
             Console.WriteLine();
             Console.WriteLine("Note: Device name is a partial match (case-insensitive)");
+            Console.WriteLine("      This tool works with CY3014/StarTech capture devices");
             return 0;
         }
+
+        [DllImport("ole32.dll")]
+        static extern int CreateBindCtx(int reserved, out IBindCtx ppbc);
 
         static int ListDevices()
         {
             Console.WriteLine("Video Capture Devices:");
             Console.WriteLine("----------------------");
 
-            List<string> devices = EnumerateVideoDevices();
+            var devices = EnumerateVideoDevices();
             if (devices.Count == 0)
             {
                 Console.WriteLine("  No video capture devices found.");
                 return 1;
             }
 
-            foreach (string device in devices)
+            foreach (var device in devices)
             {
-                Console.WriteLine("  " + device);
+                string driverKey = FindDriverKey(device.Item2);
+                string marker = !string.IsNullOrEmpty(driverKey) ? " [Switchable]" : "";
+                Console.WriteLine("  " + device.Item1 + marker);
             }
             return 0;
         }
@@ -90,448 +98,279 @@ namespace CaptureInputSwitcher
         {
             Console.WriteLine("Looking for device matching: " + deviceName);
 
-            using (FilterGraph graph = new FilterGraph(deviceName))
+            var devices = EnumerateVideoDevices();
+            foreach (var device in devices)
             {
-                IAMCrossbar crossbar = graph.FindCrossbar();
-
-                if (crossbar == null)
+                if (device.Item1.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    Console.WriteLine("No crossbar found. Device may not support input switching.");
-                    return 1;
-                }
+                    Console.WriteLine("Found: " + device.Item1);
 
-                int outputPins, inputPins;
-                crossbar.get_PinCounts(out outputPins, out inputPins);
-                Console.WriteLine();
-                Console.WriteLine("Found " + inputPins + " input(s) and " + outputPins + " output(s):");
-                Console.WriteLine();
-
-                // Get current routing
-                int currentInput = -1;
-                for (int outPin = 0; outPin < outputPins; outPin++)
-                {
-                    int outIndex;
-                    PhysicalConnectorType outType;
-                    crossbar.get_CrossbarPinInfo(false, outPin, out outIndex, out outType);
-                    if (outType == PhysicalConnectorType.Video_VideoDecoder)
+                    string driverKey = FindDriverKey(device.Item2);
+                    if (string.IsNullOrEmpty(driverKey))
                     {
-                        crossbar.get_IsRoutedTo(outPin, out currentInput);
-                        break;
+                        Console.WriteLine("Device does not have switchable inputs via registry.");
+                        return 1;
                     }
-                }
 
-                Console.WriteLine("Video Inputs:");
-                for (int i = 0; i < inputPins; i++)
-                {
-                    int relatedPin;
-                    PhysicalConnectorType pinType;
-                    crossbar.get_CrossbarPinInfo(true, i, out relatedPin, out pinType);
-                    string current = (i == currentInput) ? " <-- CURRENT" : "";
-                    Console.WriteLine("  Pin " + i + ": " + GetPinTypeName(pinType) + current);
+                    int currentInput = GetRegistryInput(driverKey);
+                    Console.WriteLine();
+                    Console.WriteLine("Available inputs:");
+                    Console.WriteLine("  0: HDMI" + (currentInput == 0 ? " <-- CURRENT" : ""));
+                    Console.WriteLine("  1: DVI" + (currentInput == 1 ? " <-- CURRENT" : ""));
+                    return 0;
                 }
-
-                return 0;
             }
+
+            Console.WriteLine("Device not found.");
+            return 1;
         }
 
-        static int SwitchInput(string deviceName, int inputPin)
+        static int SwitchInput(string deviceName, int input)
         {
-            Console.WriteLine("Switching device '" + deviceName + "' to input pin " + inputPin + "...");
-
-            using (FilterGraph graph = new FilterGraph(deviceName))
+            if (input < 0 || input > 1)
             {
-                IAMCrossbar crossbar = graph.FindCrossbar();
+                Console.WriteLine("Invalid input. Use 0 for HDMI or 1 for DVI.");
+                return 1;
+            }
 
-                if (crossbar == null)
+            Console.WriteLine("Looking for device matching: " + deviceName);
+
+            var devices = EnumerateVideoDevices();
+            foreach (var device in devices)
+            {
+                if (device.Item1.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    Console.WriteLine("No crossbar found. Device may not support input switching.");
-                    return 1;
-                }
+                    Console.WriteLine("Found: " + device.Item1);
 
-                int outputPins, inputPins;
-                crossbar.get_PinCounts(out outputPins, out inputPins);
-
-                if (inputPin < 0 || inputPin >= inputPins)
-                {
-                    Console.WriteLine("Invalid input pin. Device has " + inputPins + " input(s) (0-" + (inputPins - 1) + ")");
-                    return 1;
-                }
-
-                // Find the video decoder output pin
-                int videoOutPin = -1;
-                for (int outPin = 0; outPin < outputPins; outPin++)
-                {
-                    int related;
-                    PhysicalConnectorType outType;
-                    crossbar.get_CrossbarPinInfo(false, outPin, out related, out outType);
-                    if (outType == PhysicalConnectorType.Video_VideoDecoder)
+                    string driverKey = FindDriverKey(device.Item2);
+                    if (string.IsNullOrEmpty(driverKey))
                     {
-                        videoOutPin = outPin;
-                        break;
+                        Console.WriteLine("Device does not support input switching via registry.");
+                        return 1;
+                    }
+
+                    bool success = SetRegistryInput(driverKey, input);
+                    if (success)
+                    {
+                        string inputName = input == 0 ? "HDMI" : "DVI";
+                        Console.WriteLine("Successfully switched to input " + input + " (" + inputName + ")");
+                        Console.WriteLine();
+                        Console.WriteLine("NOTE: You may need to restart the capture source in OBS for changes to take effect.");
+                        return 0;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Failed to switch input. Try running as administrator.");
+                        return 1;
                     }
                 }
-
-                if (videoOutPin == -1)
-                {
-                    // Just try output pin 0
-                    videoOutPin = 0;
-                }
-
-                // Check if routing is possible
-                int hr = crossbar.CanRoute(videoOutPin, inputPin);
-                if (hr != 0)
-                {
-                    Console.WriteLine("Cannot route input " + inputPin + " to video output. Error: 0x" + hr.ToString("X8"));
-                    return 1;
-                }
-
-                // Perform the switch
-                hr = crossbar.Route(videoOutPin, inputPin);
-                if (hr != 0)
-                {
-                    Console.WriteLine("Failed to switch input. Error: 0x" + hr.ToString("X8"));
-                    return 1;
-                }
-
-                int relatedPin;
-                PhysicalConnectorType pinType;
-                crossbar.get_CrossbarPinInfo(true, inputPin, out relatedPin, out pinType);
-                Console.WriteLine("Successfully switched to input " + inputPin + " (" + GetPinTypeName(pinType) + ")");
-                return 0;
             }
+
+            Console.WriteLine("Device not found.");
+            return 1;
         }
 
         static int GetCurrentInput(string deviceName)
         {
-            using (FilterGraph graph = new FilterGraph(deviceName))
+            var devices = EnumerateVideoDevices();
+            foreach (var device in devices)
             {
-                IAMCrossbar crossbar = graph.FindCrossbar();
-
-                if (crossbar == null)
+                if (device.Item1.IndexOf(deviceName, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    Console.WriteLine("No crossbar found.");
-                    return 1;
-                }
-
-                int outputPins, inputPins;
-                crossbar.get_PinCounts(out outputPins, out inputPins);
-
-                for (int outPin = 0; outPin < outputPins; outPin++)
-                {
-                    int related;
-                    PhysicalConnectorType outType;
-                    crossbar.get_CrossbarPinInfo(false, outPin, out related, out outType);
-                    if (outType == PhysicalConnectorType.Video_VideoDecoder)
+                    string driverKey = FindDriverKey(device.Item2);
+                    if (string.IsNullOrEmpty(driverKey))
                     {
-                        int inputPinResult;
-                        crossbar.get_IsRoutedTo(outPin, out inputPinResult);
-                        int relatedPin;
-                        PhysicalConnectorType pinType;
-                        crossbar.get_CrossbarPinInfo(true, inputPinResult, out relatedPin, out pinType);
-                        Console.WriteLine("Current input: Pin " + inputPinResult + " (" + GetPinTypeName(pinType) + ")");
-                        return inputPinResult;
+                        Console.WriteLine("Device does not support input switching via registry.");
+                        return -1;
                     }
-                }
 
-                Console.WriteLine("Could not determine current input.");
-                return -1;
+                    int currentInput = GetRegistryInput(driverKey);
+                    string inputName = currentInput == 0 ? "HDMI" : "DVI";
+                    Console.WriteLine("Current input: " + currentInput + " (" + inputName + ")");
+                    return currentInput;
+                }
             }
+
+            Console.WriteLine("Device not found.");
+            return -1;
         }
 
-        static List<string> EnumerateVideoDevices()
+        static List<Tuple<string, string>> EnumerateVideoDevices()
         {
-            List<string> devices = new List<string>();
+            var devices = new List<Tuple<string, string>>();
 
-            ICreateDevEnum devEnum = (ICreateDevEnum)new CreateDevEnum();
+            Type devEnumType = Type.GetTypeFromCLSID(new Guid("62BE5D10-60EB-11d0-BD3B-00A0C911CE86"));
+            object devEnumObj = Activator.CreateInstance(devEnumType);
+            ICreateDevEnum devEnum = (ICreateDevEnum)devEnumObj;
+
             IEnumMoniker enumMoniker;
-            Guid videoInputCategory = FilterCategory.VideoInputDevice;
+            Guid videoInputCategory = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
             int hr = devEnum.CreateClassEnumerator(ref videoInputCategory, out enumMoniker, 0);
 
             if (hr != 0 || enumMoniker == null)
+            {
+                Marshal.ReleaseComObject(devEnumObj);
                 return devices;
+            }
 
             IMoniker[] moniker = new IMoniker[1];
             while (enumMoniker.Next(1, moniker, IntPtr.Zero) == 0)
             {
+                IBindCtx bindCtx;
+                CreateBindCtx(0, out bindCtx);
+
                 object bagObj;
                 Guid propBagGuid = typeof(IPropertyBag).GUID;
-                moniker[0].BindToStorage(null, null, ref propBagGuid, out bagObj);
-                IPropertyBag bag = (IPropertyBag)bagObj;
+                moniker[0].BindToStorage(bindCtx, null, ref propBagGuid, out bagObj);
 
-                object nameObj;
-                bag.Read("FriendlyName", out nameObj, null);
-                devices.Add(nameObj != null ? nameObj.ToString() : "Unknown Device");
+                string name = "";
+                string devicePath = "";
+                if (bagObj != null)
+                {
+                    IPropertyBag bag = (IPropertyBag)bagObj;
+                    object nameObj, pathObj;
+                    bag.Read("FriendlyName", out nameObj, null);
+                    bag.Read("DevicePath", out pathObj, null);
+                    name = nameObj != null ? nameObj.ToString() : "Unknown Device";
+                    devicePath = pathObj != null ? pathObj.ToString() : "";
+                    Marshal.ReleaseComObject(bag);
+                }
 
-                Marshal.ReleaseComObject(bag);
+                devices.Add(new Tuple<string, string>(name, devicePath));
+
+                Marshal.ReleaseComObject(bindCtx);
                 Marshal.ReleaseComObject(moniker[0]);
             }
 
             Marshal.ReleaseComObject(enumMoniker);
-            Marshal.ReleaseComObject(devEnum);
+            Marshal.ReleaseComObject(devEnumObj);
 
             return devices;
         }
 
-        static string GetPinTypeName(PhysicalConnectorType type)
+        static string FindDriverKey(string devicePath)
         {
-            switch (type)
-            {
-                case PhysicalConnectorType.Video_Tuner: return "Tuner";
-                case PhysicalConnectorType.Video_Composite: return "Composite";
-                case PhysicalConnectorType.Video_SVideo: return "S-Video";
-                case PhysicalConnectorType.Video_RGB: return "RGB";
-                case PhysicalConnectorType.Video_YRYBY: return "Component (YPbPr)";
-                case PhysicalConnectorType.Video_SerialDigital: return "SDI";
-                case PhysicalConnectorType.Video_ParallelDigital: return "Parallel Digital";
-                case PhysicalConnectorType.Video_SCSI: return "SCSI";
-                case PhysicalConnectorType.Video_AUX: return "AUX";
-                case PhysicalConnectorType.Video_1394: return "FireWire";
-                case PhysicalConnectorType.Video_USB: return "USB";
-                case PhysicalConnectorType.Video_VideoDecoder: return "Video Decoder";
-                case PhysicalConnectorType.Video_VideoEncoder: return "Video Encoder";
-                case PhysicalConnectorType.Video_SCART: return "SCART";
-                case PhysicalConnectorType.Video_Black: return "Black";
-                case (PhysicalConnectorType)0x1000: return "HDMI";
-                case (PhysicalConnectorType)0x1001: return "DVI";
-                case (PhysicalConnectorType)0x1002: return "DisplayPort";
-                default: return "Unknown (" + ((int)type).ToString("X") + ")";
-            }
-        }
-    }
-
-    // Filter graph helper class
-    class FilterGraph : IDisposable
-    {
-        private IGraphBuilder _graph;
-        private IBaseFilter _captureFilter;
-        private ICaptureGraphBuilder2 _captureBuilder;
-        private bool _disposed;
-
-        public FilterGraph(string deviceNamePart)
-        {
-            _graph = (IGraphBuilder)new FilterGraphManager();
-            _captureBuilder = (ICaptureGraphBuilder2)new CaptureGraphBuilder2();
-            _captureBuilder.SetFiltergraph(_graph);
-
-            _captureFilter = FindAndCreateCaptureFilter(deviceNamePart);
-            if (_captureFilter == null)
-                throw new Exception("Device containing '" + deviceNamePart + "' not found.");
-
-            _graph.AddFilter(_captureFilter, "Capture");
-        }
-
-        public IAMCrossbar FindCrossbar()
-        {
-            if (_captureBuilder == null || _captureFilter == null)
+            // Extract VID and PID from device path
+            // Format: \\?\usb#vid_1164&pid_f533#...
+            if (string.IsNullOrEmpty(devicePath))
                 return null;
 
-            object crossbarObj;
-            Guid crossbarGuid = typeof(IAMCrossbar).GUID;
-            Guid pinCat = PinCategory.Capture;
-            Guid mediaType = MediaType.Video;
-
-            // Try to find crossbar upstream of the capture filter
-            int hr = _captureBuilder.FindInterface(
-                ref pinCat,
-                ref mediaType,
-                _captureFilter,
-                ref crossbarGuid,
-                out crossbarObj);
-
-            if (hr == 0 && crossbarObj != null)
-                return (IAMCrossbar)crossbarObj;
-
-            // Try without pin category
-            Guid emptyGuid = Guid.Empty;
-            hr = _captureBuilder.FindInterface(
-                ref emptyGuid,
-                ref mediaType,
-                _captureFilter,
-                ref crossbarGuid,
-                out crossbarObj);
-
-            if (hr == 0 && crossbarObj != null)
-                return (IAMCrossbar)crossbarObj;
-
-            // Try to find it by enumerating filters
-            return FindCrossbarByEnumeration();
-        }
-
-        private IAMCrossbar FindCrossbarByEnumeration()
-        {
-            // Some devices need the graph to be built first
-            if (_captureBuilder != null && _captureFilter != null)
+            string vidPid = "";
+            int vidIdx = devicePath.IndexOf("vid_", StringComparison.OrdinalIgnoreCase);
+            if (vidIdx >= 0)
             {
-                Guid pinCat = PinCategory.Capture;
-                Guid mediaType = MediaType.Video;
-                _captureBuilder.RenderStream(ref pinCat, ref mediaType, _captureFilter, null, null);
-            }
-
-            if (_graph == null) return null;
-
-            IEnumFilters enumFilters;
-            _graph.EnumFilters(out enumFilters);
-            if (enumFilters == null) return null;
-
-            IBaseFilter[] filters = new IBaseFilter[1];
-            while (enumFilters.Next(1, filters, IntPtr.Zero) == 0)
-            {
-                IAMCrossbar crossbar = filters[0] as IAMCrossbar;
-                if (crossbar != null)
+                int hashIdx = devicePath.IndexOf('#', vidIdx);
+                if (hashIdx > vidIdx)
                 {
-                    Marshal.ReleaseComObject(enumFilters);
-                    return crossbar;
+                    vidPid = devicePath.Substring(vidIdx, hashIdx - vidIdx).ToUpper();
                 }
-                Marshal.ReleaseComObject(filters[0]);
             }
-            Marshal.ReleaseComObject(enumFilters);
+
+            if (string.IsNullOrEmpty(vidPid))
+                return null;
+
+            // Search for the device in USB enum
+            try
+            {
+                using (RegistryKey usbKey = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USB"))
+                {
+                    if (usbKey == null) return null;
+
+                    foreach (string subKeyName in usbKey.GetSubKeyNames())
+                    {
+                        if (subKeyName.IndexOf(vidPid, StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            using (RegistryKey vidPidKey = usbKey.OpenSubKey(subKeyName))
+                            {
+                                if (vidPidKey == null) continue;
+
+                                foreach (string instanceName in vidPidKey.GetSubKeyNames())
+                                {
+                                    using (RegistryKey instanceKey = vidPidKey.OpenSubKey(instanceName))
+                                    {
+                                        if (instanceKey == null) continue;
+
+                                        object driverRef = instanceKey.GetValue("Driver");
+                                        if (driverRef != null)
+                                        {
+                                            string driverPath = @"SYSTEM\CurrentControlSet\Control\Class\" + driverRef.ToString();
+
+                                            // Verify this driver has the AnalogCrossbarVideoInputProperty
+                                            using (RegistryKey driverKey = Registry.LocalMachine.OpenSubKey(driverPath))
+                                            {
+                                                if (driverKey != null && driverKey.GetValue("AnalogCrossbarVideoInputProperty") != null)
+                                                {
+                                                    return driverPath;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                return null;
+            }
+
             return null;
         }
 
-        private static IBaseFilter FindAndCreateCaptureFilter(string deviceNamePart)
+        static int GetRegistryInput(string driverKeyPath)
         {
-            ICreateDevEnum devEnum = (ICreateDevEnum)new CreateDevEnum();
-            IEnumMoniker enumMoniker;
-            Guid videoInputCategory = FilterCategory.VideoInputDevice;
-            devEnum.CreateClassEnumerator(ref videoInputCategory, out enumMoniker, 0);
-
-            if (enumMoniker == null)
-                return null;
-
-            IMoniker[] moniker = new IMoniker[1];
-            IBaseFilter result = null;
-
-            while (enumMoniker.Next(1, moniker, IntPtr.Zero) == 0)
+            try
             {
-                object bagObj;
-                Guid propBagGuid = typeof(IPropertyBag).GUID;
-                moniker[0].BindToStorage(null, null, ref propBagGuid, out bagObj);
-                IPropertyBag bag = (IPropertyBag)bagObj;
-
-                object nameObj;
-                bag.Read("FriendlyName", out nameObj, null);
-                string name = nameObj != null ? nameObj.ToString() : "";
-
-                Marshal.ReleaseComObject(bag);
-
-                if (name.IndexOf(deviceNamePart, StringComparison.OrdinalIgnoreCase) >= 0)
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(driverKeyPath))
                 {
-                    object filterObj;
-                    Guid baseFilterGuid = typeof(IBaseFilter).GUID;
-                    moniker[0].BindToObject(null, null, ref baseFilterGuid, out filterObj);
-                    result = (IBaseFilter)filterObj;
-                    Marshal.ReleaseComObject(moniker[0]);
-                    break;
+                    if (key != null)
+                    {
+                        object value = key.GetValue("AnalogCrossbarVideoInputProperty");
+                        if (value != null)
+                        {
+                            return Convert.ToInt32(value);
+                        }
+                    }
                 }
-
-                Marshal.ReleaseComObject(moniker[0]);
             }
-
-            Marshal.ReleaseComObject(enumMoniker);
-            Marshal.ReleaseComObject(devEnum);
-
-            return result;
+            catch { }
+            return -1;
         }
 
-        public void Dispose()
+        static bool SetRegistryInput(string driverKeyPath, int input)
         {
-            if (_disposed) return;
-            _disposed = true;
-
-            if (_captureFilter != null)
+            try
             {
-                Marshal.ReleaseComObject(_captureFilter);
-                _captureFilter = null;
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(driverKeyPath, true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("AnalogCrossbarVideoInputProperty", input, RegistryValueKind.DWord);
+                        return true;
+                    }
+                }
             }
-            if (_captureBuilder != null)
+            catch (UnauthorizedAccessException)
             {
-                Marshal.ReleaseComObject(_captureBuilder);
-                _captureBuilder = null;
+                Console.WriteLine("Access denied. Run as administrator to switch inputs.");
             }
-            if (_graph != null)
+            catch (Exception ex)
             {
-                Marshal.ReleaseComObject(_graph);
-                _graph = null;
+                Console.WriteLine("Error: " + ex.Message);
             }
+            return false;
         }
     }
 
     // COM Interop definitions
-
-    [ComImport, Guid("29840822-5B84-11D0-BD3B-00A0C911CE86")]
-    class CreateDevEnum { }
-
-    [ComImport, Guid("E436EBB3-524F-11CE-9F53-0020AF0BA770")]
-    class FilterGraphManager { }
-
-    [ComImport, Guid("BF87B6E1-8C27-11D0-B3F0-00AA003761C5")]
-    class CaptureGraphBuilder2 { }
-
-    static class FilterCategory
-    {
-        public static readonly Guid VideoInputDevice = new Guid("860BB310-5D01-11D0-BD3B-00A0C911CE86");
-    }
-
-    static class PinCategory
-    {
-        public static readonly Guid Capture = new Guid("FB6C4281-0353-11D1-905F-0000C0CC16BA");
-    }
-
-    static class MediaType
-    {
-        public static readonly Guid Video = new Guid("73646976-0000-0010-8000-00AA00389B71");
-    }
-
-    enum PhysicalConnectorType
-    {
-        Video_Tuner = 1,
-        Video_Composite = 2,
-        Video_SVideo = 3,
-        Video_RGB = 4,
-        Video_YRYBY = 5,
-        Video_SerialDigital = 6,
-        Video_ParallelDigital = 7,
-        Video_SCSI = 8,
-        Video_AUX = 9,
-        Video_1394 = 10,
-        Video_USB = 11,
-        Video_VideoDecoder = 12,
-        Video_VideoEncoder = 13,
-        Video_SCART = 14,
-        Video_Black = 15,
-    }
 
     [ComImport, Guid("29840822-5B84-11D0-BD3B-00A0C911CE86"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface ICreateDevEnum
     {
         [PreserveSig]
         int CreateClassEnumerator([In] ref Guid type, out IEnumMoniker enumMoniker, [In] int flags);
-    }
-
-    [ComImport, Guid("00000102-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IEnumMoniker
-    {
-        [PreserveSig]
-        int Next([In] int count, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] IMoniker[] monikers, IntPtr fetched);
-        [PreserveSig]
-        int Skip([In] int count);
-        void Reset();
-        void Clone(out IEnumMoniker enumMoniker);
-    }
-
-    [ComImport, Guid("0000000F-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IMoniker
-    {
-        void QueryInterface_OnlyForPadding();
-        void AddRef_OnlyForPadding();
-        void Release_OnlyForPadding();
-        void GetClassID(out Guid classID);
-        void IsDirty();
-        void Load(object stream);
-        void Save(object stream, bool clearDirty);
-        void GetSizeMax(out long size);
-        void BindToObject(object bindCtx, IMoniker moniker, [In] ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
-        void BindToStorage(object bindCtx, IMoniker moniker, [In] ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
     }
 
     [ComImport, Guid("55272A00-42CB-11CE-8135-00AA004BB851"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -541,91 +380,5 @@ namespace CaptureInputSwitcher
         int Read([In, MarshalAs(UnmanagedType.LPWStr)] string propName, [Out, MarshalAs(UnmanagedType.Struct)] out object val, object errorLog);
         [PreserveSig]
         int Write([In, MarshalAs(UnmanagedType.LPWStr)] string propName, [In] ref object val);
-    }
-
-    [ComImport, Guid("56A86895-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IBaseFilter
-    {
-        void GetClassID(out Guid classID);
-        void Stop();
-        void Pause();
-        void Run(long start);
-        void GetState(int timeout, out int state);
-        void SetSyncSource(IntPtr clock);
-        void GetSyncSource(out IntPtr clock);
-        void EnumPins(out IntPtr enumPins);
-        void FindPin(string id, out IntPtr pin);
-        void QueryFilterInfo(out IntPtr info);
-        void JoinFilterGraph(IntPtr graph, string name);
-        void QueryVendorInfo(out IntPtr vendorInfo);
-    }
-
-    [ComImport, Guid("56A868A9-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IGraphBuilder
-    {
-        void AddFilter([In] IBaseFilter filter, [In, MarshalAs(UnmanagedType.LPWStr)] string name);
-        void RemoveFilter([In] IBaseFilter filter);
-        void EnumFilters(out IEnumFilters enumFilters);
-        void FindFilterByName([In, MarshalAs(UnmanagedType.LPWStr)] string name, out IBaseFilter filter);
-        void ConnectDirect(IntPtr pinOut, IntPtr pinIn, IntPtr mediaType);
-        void Reconnect(IntPtr pin);
-        void Disconnect(IntPtr pin);
-        void SetDefaultSyncSource();
-        void Connect(IntPtr pinOut, IntPtr pinIn);
-        void Render(IntPtr pinOut);
-        void RenderFile([In, MarshalAs(UnmanagedType.LPWStr)] string file, [In, MarshalAs(UnmanagedType.LPWStr)] string playList);
-        void AddSourceFilter([In, MarshalAs(UnmanagedType.LPWStr)] string fileName, [In, MarshalAs(UnmanagedType.LPWStr)] string filterName, out IBaseFilter filter);
-        void SetLogFile(IntPtr file);
-        void Abort();
-        void ShouldOperationContinue();
-    }
-
-    [ComImport, Guid("56A86893-0AD4-11CE-B03A-0020AF0BA770"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IEnumFilters
-    {
-        [PreserveSig]
-        int Next([In] int count, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] IBaseFilter[] filters, IntPtr fetched);
-        [PreserveSig]
-        int Skip([In] int count);
-        void Reset();
-        void Clone(out IEnumFilters enumFilters);
-    }
-
-    [ComImport, Guid("93E5A4E0-2D50-11D2-ABFA-00A0C9C6E38D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface ICaptureGraphBuilder2
-    {
-        void SetFiltergraph([In] IGraphBuilder graph);
-        void GetFiltergraph(out IGraphBuilder graph);
-        void SetOutputFileName(ref Guid type, [In, MarshalAs(UnmanagedType.LPWStr)] string fileName, out IBaseFilter filter, out IntPtr sink);
-
-        [PreserveSig]
-        int FindInterface([In] ref Guid category, [In] ref Guid type, [In] IBaseFilter filter, [In] ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
-
-        [PreserveSig]
-        int RenderStream([In] ref Guid category, [In] ref Guid type, [In, MarshalAs(UnmanagedType.IUnknown)] object source, [In] IBaseFilter compressor, [In] IBaseFilter renderer);
-
-        void ControlStream(ref Guid category, ref Guid type, IBaseFilter filter, long start, long stop, short sendExtra, out short dropped);
-        void AllocCapFile([In, MarshalAs(UnmanagedType.LPWStr)] string fileName, long size);
-        void CopyCaptureFile([In, MarshalAs(UnmanagedType.LPWStr)] string oldFile, [In, MarshalAs(UnmanagedType.LPWStr)] string newFile, int allowEscAbort, IntPtr callback);
-        void FindPin(object source, int direction, ref Guid category, ref Guid type, bool unconnected, int index, out IntPtr pin);
-    }
-
-    [ComImport, Guid("C6E13380-30AC-11D0-A18C-00A0C9118956"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    interface IAMCrossbar
-    {
-        [PreserveSig]
-        int get_PinCounts(out int outputPins, out int inputPins);
-
-        [PreserveSig]
-        int CanRoute([In] int outputPin, [In] int inputPin);
-
-        [PreserveSig]
-        int Route([In] int outputPin, [In] int inputPin);
-
-        [PreserveSig]
-        int get_IsRoutedTo([In] int outputPin, out int inputPin);
-
-        [PreserveSig]
-        int get_CrossbarPinInfo([In] bool isInput, [In] int pinIndex, out int relatedPinIndex, out PhysicalConnectorType type);
     }
 }

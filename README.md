@@ -1,13 +1,18 @@
 # CaptureInputSwitcher
 
-A command-line tool to switch video inputs (HDMI/DVI/etc.) on DirectShow capture devices like the USB3HDCAP.
+A command-line tool to switch video inputs (HDMI/DVI) on CY3014/StarTech capture devices.
 
 ## Use Case
 
-Programmatically switch between video inputs on capture cards that expose their input selection through DirectShow's `IAMCrossbar` interface. Useful for:
+Programmatically switch between video inputs on capture cards that store their input selection in the Windows registry. Useful for:
 - OBS Studio automation
 - Scripted input switching
 - Hotkey-triggered source changes
+
+## Supported Devices
+
+- StarTech.com USB3HDCAP (CY3014)
+- Other Yuan/Multimedia capture devices with the `AnalogCrossbarVideoInputProperty` registry setting
 
 ## Building
 
@@ -20,18 +25,20 @@ C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe /out:CaptureInputSwitcher.
 ## Usage
 
 ```cmd
-:: List all video capture devices
+:: List all video capture devices (switchable ones are marked)
 CaptureInputSwitcher.exe list
 
 :: Show available inputs for a device
-CaptureInputSwitcher.exe inputs USB3HDCAP
+CaptureInputSwitcher.exe inputs CY3014
 
-:: Switch to a specific input pin
-CaptureInputSwitcher.exe switch 0 USB3HDCAP   # Switch to pin 0 (e.g., HDMI)
-CaptureInputSwitcher.exe switch 1 USB3HDCAP   # Switch to pin 1 (e.g., DVI)
+:: Switch to HDMI (input 0) - requires admin rights
+CaptureInputSwitcher.exe switch 0 CY3014
+
+:: Switch to DVI (input 1) - requires admin rights
+CaptureInputSwitcher.exe switch 1 CY3014
 
 :: Get current input
-CaptureInputSwitcher.exe get USB3HDCAP
+CaptureInputSwitcher.exe get CY3014
 ```
 
 The device name is a partial, case-insensitive match.
@@ -39,21 +46,52 @@ The device name is a partial, case-insensitive match.
 ## Example Output
 
 ```
-> CaptureInputSwitcher.exe inputs USB3HDCAP
-Looking for device matching: USB3HDCAP
+> CaptureInputSwitcher.exe list
+Video Capture Devices:
+----------------------
+  Integrated Camera
+  CY3014 USB, Analog 01 Capture [Switchable]
+  OBS Virtual Camera
 
-Found 2 input(s) and 1 output(s):
+> CaptureInputSwitcher.exe inputs CY3014
+Looking for device matching: CY3014
+Found: CY3014 USB, Analog 01 Capture
 
-Video Inputs:
-  Pin 0: HDMI <-- CURRENT
-  Pin 1: DVI
+Available inputs:
+  0: HDMI <-- CURRENT
+  1: DVI
 ```
 
 ## Requirements
 
 - Windows 7 or later
 - .NET Framework 4.0+ (included in Windows)
-- No admin rights required to run
+- **Administrator rights required** for switching inputs (writes to HKLM registry)
+
+## How It Works
+
+The tool modifies the `AnalogCrossbarVideoInputProperty` registry value in the device's driver settings:
+```
+HKLM\SYSTEM\CurrentControlSet\Control\Class\{...}\xxxx\AnalogCrossbarVideoInputProperty
+```
+
+After changing the registry value, you may need to restart the capture source in OBS for changes to take effect.
+
+## Batch Files for Easy Switching
+
+Create these batch files and run them as administrator:
+
+**switch-hdmi.bat**
+```batch
+@echo off
+CaptureInputSwitcher.exe switch 0 CY3014
+```
+
+**switch-dvi.bat**
+```batch
+@echo off
+CaptureInputSwitcher.exe switch 1 CY3014
+```
 
 ## License
 
